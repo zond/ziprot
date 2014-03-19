@@ -1,6 +1,7 @@
 package ziprot
 
 import (
+	"compress/gzip"
 	"fmt"
 	"log"
 	"math/rand"
@@ -15,13 +16,65 @@ func init() {
 	rand.Seed(time.Now().UnixNano())
 }
 
+type ZipWriter struct {
+	closed int64
+	file   *os.File
+	writer *gzip.Writer
+}
+
+func NewZipWriter(f *os.File) *ZipWriter {
+	return &ZipWriter{
+		file:   f,
+		writer: gzip.NewWriter(f),
+	}
+}
+
+func (self *ZipWriter) Size() (result int64, err error) {
+	stat, err := self.file.Stat()
+	if err != nil {
+		return
+	}
+	result = stat.Size()
+	return
+}
+
+func (self *ZipWriter) Closed() bool {
+	return atomic.LoadInt64(&self.closed) == 1
+}
+
+func (self *ZipWriter) Close() (err error) {
+	if atomic.CompareAndSwapInt64(&self.closed, 0, 1) {
+		if err = self.writer.Close(); err != nil {
+			return
+		}
+		if err = self.file.Close(); err != nil {
+			return
+		}
+	}
+	return
+}
+
+func (self *ZipWriter) Write(p []byte) (n int, err error) {
+	if n, err = self.writer.Write(p); err != nil {
+		return
+	}
+	if err = self.writer.Flush(); err != nil {
+		return
+	}
+	return
+}
+
+func (self *ZipWriter) Sync() (err error) {
+	return self.file.Sync()
+}
+
 type ZipRot struct {
-	base     string
-	_file    unsafe.Pointer
-	maxFiles int64
-	maxSize  int64
-	rotators int64
-	nonblock int64
+	base       string
+	_zipWriter unsafe.Pointer
+	maxFiles   int64
+	maxSize    int64
+	rotators   int64
+	nonblock   int64
 }
 
 func New(base string) (self *ZipRot, err error) {
@@ -52,7 +105,7 @@ func (self *ZipRot) freeName(n int) (err error) {
 	return os.Rename(name, fmt.Sprintf("%v.%v", self.base, n+1))
 }
 
-func (self *ZipRot) rotate(oldFile *os.File) (err error) {
+func (self *ZipRot) rotate(oldZipWriter *ZipWriter) (err error) {
 	if atomic.CompareAndSwapInt64(&self.rotators, 0, 1) {
 		defer atomic.StoreInt64(&self.rotators, 0)
 		if err = self.freeName(1); err != nil {
@@ -72,12 +125,13 @@ func (self *ZipRot) rotate(oldFile *os.File) (err error) {
 		if err != nil {
 			return
 		}
-		atomic.StorePointer(&self._file, unsafe.Pointer(newFile))
-		runtime.SetFinalizer(newFile, func(f *os.File) {
+		newZipWriter := NewZipWriter(newFile)
+		runtime.SetFinalizer(newZipWriter, func(f *ZipWriter) {
 			f.Close()
 		})
-		if oldFile != nil {
-			if err = oldFile.Sync(); err != nil {
+		atomic.StorePointer(&self._zipWriter, unsafe.Pointer(newZipWriter))
+		if oldZipWriter != nil {
+			if err = oldZipWriter.Close(); err != nil {
 				err = fmt.Errorf("Trying to sync old file: %v", err)
 				return
 			}
@@ -86,8 +140,8 @@ func (self *ZipRot) rotate(oldFile *os.File) (err error) {
 	return
 }
 
-func (self *ZipRot) file() *os.File {
-	return (*os.File)(atomic.LoadPointer(&self._file))
+func (self *ZipRot) zipWriter() *ZipWriter {
+	return (*ZipWriter)(atomic.LoadPointer(&self._zipWriter))
 }
 
 func (self *ZipRot) MaxFiles(n int64) *ZipRot {
@@ -110,22 +164,27 @@ func (self *ZipRot) Block(b bool) *ZipRot {
 }
 
 func (self *ZipRot) Write(p []byte) (n int, err error) {
-	file := self.file()
-	if n, err = file.Write(p); err != nil {
-		return
+	var zipWriter *ZipWriter
+	for {
+		zipWriter = self.zipWriter()
+		if n, err = zipWriter.Write(p); err == nil {
+			break
+		} else if !zipWriter.Closed() {
+			return
+		}
 	}
-	stat, err := file.Stat()
+	size, err := zipWriter.Size()
 	if err != nil {
 		return
 	}
-	if stat.Size() > atomic.LoadInt64(&self.maxSize) {
+	if size > atomic.LoadInt64(&self.maxSize) {
 		if atomic.LoadInt64(&self.nonblock) == 0 {
-			if err = self.rotate(file); err != nil {
+			if err = self.rotate(zipWriter); err != nil {
 				return
 			}
 		} else {
 			go func() {
-				if err := self.rotate(file); err != nil {
+				if err := self.rotate(zipWriter); err != nil {
 					log.Printf("While trying to rotate: %v", err)
 				}
 			}()
@@ -135,5 +194,5 @@ func (self *ZipRot) Write(p []byte) (n int, err error) {
 }
 
 func (self *ZipRot) Close() error {
-	return self.file().Close()
+	return self.zipWriter().Close()
 }
