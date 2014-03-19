@@ -2,82 +2,32 @@ package ziprot
 
 import (
 	"fmt"
+	"math/rand"
 	"os"
-	"sync"
+	"runtime"
 	"sync/atomic"
+	"time"
 	"unsafe"
 )
+
+func init() {
+	rand.Seed(time.Now().UnixNano())
+}
 
 type ZipRot struct {
 	base     string
 	_file    unsafe.Pointer
-	size     int64
 	maxFiles int64
 	maxSize  int64
-	lock     *sync.Mutex
+	rotators int64
 }
 
 func New(base string) (self *ZipRot, err error) {
 	self = &ZipRot{
 		base: base,
-		lock: &sync.Mutex{},
 	}
-	if err = self.open(); err != nil {
+	if err = self.rotate(nil); err != nil {
 		return
-	}
-	if err = self.maybeRotate(); err != nil {
-		return
-	}
-	return
-}
-
-func (self *ZipRot) open() (err error) {
-	file, err := os.OpenFile(self.base, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0640)
-	if err != nil {
-		return
-	}
-	stat, err := file.Stat()
-	if err != nil {
-		return
-	}
-	atomic.StorePointer(&self._file, unsafe.Pointer(file))
-	atomic.StoreInt64(&self.size, stat.Size())
-	return
-}
-
-func (self *ZipRot) file() *os.File {
-	return (*os.File)(atomic.LoadPointer(&self._file))
-}
-
-func (self *ZipRot) MaxFiles(n int64) *ZipRot {
-	atomic.StoreInt64(&self.maxFiles, n)
-	return self
-}
-
-func (self *ZipRot) MaxSize(n int64) *ZipRot {
-	atomic.StoreInt64(&self.maxSize, n)
-	return self
-}
-
-func (self *ZipRot) Write(p []byte) (n int, err error) {
-	n, err = self.file().Write(p)
-	if err != nil {
-		return
-	}
-	atomic.AddInt64(&self.size, int64(n))
-	if err = self.maybeRotate(); err != nil {
-		return
-	}
-	return
-}
-
-func (self *ZipRot) Close() error {
-	return self.file().Close()
-}
-
-func (self *ZipRot) maybeRotate() (err error) {
-	if atomic.LoadInt64(&self.size) > atomic.LoadInt64(&self.maxSize) {
-		return self.rotate()
 	}
 	return
 }
@@ -100,21 +50,71 @@ func (self *ZipRot) freeName(n int) (err error) {
 	return os.Rename(name, fmt.Sprintf("%v.%v", self.base, n+1))
 }
 
-func (self *ZipRot) rotate() (err error) {
-	self.lock.Lock()
-	defer self.lock.Unlock()
-	if err = self.freeName(1); err != nil {
-		return
-	}
-	if err = os.Rename(self.base, fmt.Sprintf("%v.1", self.base)); err != nil {
-		return
-	}
-	oldFile := self.file()
-	if err = self.open(); err != nil {
-		return
-	}
-	if err = oldFile.Sync(); err != nil {
-		return
+func (self *ZipRot) rotate(oldFile *os.File) (err error) {
+	if atomic.CompareAndSwapInt64(&self.rotators, 0, 1) {
+		defer atomic.StoreInt64(&self.rotators, 0)
+		if err = self.freeName(1); err != nil {
+			err = fmt.Errorf("Trying to free %v.1: %v", self.base, err)
+			return
+		}
+		if err = os.Rename(self.base, fmt.Sprintf("%v.1", self.base)); err != nil {
+			if os.IsNotExist(err) {
+				err = nil
+			} else {
+				err = fmt.Errorf("Trying to rename %v to %v.1: %v", self.base, self.base, err)
+				return
+			}
+		}
+		var newFile *os.File
+		newFile, err = os.OpenFile(self.base, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0640)
+		if err != nil {
+			return
+		}
+		atomic.StorePointer(&self._file, unsafe.Pointer(newFile))
+		runtime.SetFinalizer(newFile, func(f *os.File) {
+			f.Close()
+		})
+		if oldFile != nil {
+			if err = oldFile.Sync(); err != nil {
+				err = fmt.Errorf("Trying to sync old file: %v", err)
+				return
+			}
+		}
 	}
 	return
+}
+
+func (self *ZipRot) file() *os.File {
+	return (*os.File)(atomic.LoadPointer(&self._file))
+}
+
+func (self *ZipRot) MaxFiles(n int64) *ZipRot {
+	atomic.StoreInt64(&self.maxFiles, n)
+	return self
+}
+
+func (self *ZipRot) MaxSize(n int64) *ZipRot {
+	atomic.StoreInt64(&self.maxSize, n)
+	return self
+}
+
+func (self *ZipRot) Write(p []byte) (n int, err error) {
+	file := self.file()
+	if n, err = file.Write(p); err != nil {
+		return
+	}
+	stat, err := file.Stat()
+	if err != nil {
+		return
+	}
+	if stat.Size() > atomic.LoadInt64(&self.maxSize) {
+		if err = self.rotate(file); err != nil {
+			return
+		}
+	}
+	return
+}
+
+func (self *ZipRot) Close() error {
+	return self.file().Close()
 }

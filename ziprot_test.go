@@ -12,7 +12,7 @@ import (
 func TestSmallFiles(t *testing.T) {
 	z, err := New("TestSmallFiles")
 	if err != nil {
-		return
+		t.Fatalf("%v", err)
 	}
 	str := "0123456789"
 	z.MaxFiles(5).MaxSize(32)
