@@ -17,16 +17,35 @@ func init() {
 }
 
 type ZipWriter struct {
-	closed int64
-	file   *os.File
-	writer *gzip.Writer
+	closed     int64
+	file       *os.File
+	zipFile    *os.File
+	zipWriter  *gzip.Writer
+	zipChannel chan []byte
+	zipDone    chan struct{}
 }
 
-func NewZipWriter(f *os.File) *ZipWriter {
-	return &ZipWriter{
-		file:   f,
-		writer: gzip.NewWriter(f),
+func NewZipWriter(base string) (self *ZipWriter, err error) {
+	self = &ZipWriter{
+		zipChannel: make(chan []byte),
+		zipDone:    make(chan struct{}, 128),
 	}
+	if self.file, err = os.Create(base); err != nil {
+		return
+	}
+	if self.zipFile, err = os.Create(fmt.Sprintf("%v.gz", base)); err != nil {
+		return
+	}
+	self.zipWriter = gzip.NewWriter(self.zipFile)
+	go self.zip()
+	return
+}
+
+func (self *ZipWriter) zip() {
+	for b := range self.zipChannel {
+		self.zipWriter.Write(b)
+	}
+	close(self.zipDone)
 }
 
 func (self *ZipWriter) Size() (result int64, err error) {
@@ -44,7 +63,12 @@ func (self *ZipWriter) Closed() bool {
 
 func (self *ZipWriter) Close() (err error) {
 	if atomic.CompareAndSwapInt64(&self.closed, 0, 1) {
-		if err = self.writer.Close(); err != nil {
+		close(self.zipChannel)
+		<-self.zipDone
+		if err = self.zipWriter.Close(); err != nil {
+			return
+		}
+		if err = self.zipFile.Close(); err != nil {
 			return
 		}
 		if err = self.file.Close(); err != nil {
@@ -55,12 +79,14 @@ func (self *ZipWriter) Close() (err error) {
 }
 
 func (self *ZipWriter) Write(p []byte) (n int, err error) {
-	if n, err = self.writer.Write(p); err != nil {
+	if atomic.LoadInt64(&self.closed) == 1 {
+		err = fmt.Errorf("Writer closed")
 		return
 	}
-	if err = self.writer.Flush(); err != nil {
+	if n, err = self.file.Write(p); err != nil {
 		return
 	}
+	self.zipChannel <- p
 	return
 }
 
@@ -88,7 +114,7 @@ func New(base string) (self *ZipRot, err error) {
 }
 
 func (self *ZipRot) freeName(n int) (err error) {
-	name := fmt.Sprintf("%v.%v", self.base, n)
+	name := fmt.Sprintf("%v.gz.%v", self.base, n)
 	_, err = os.Stat(name)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -102,30 +128,29 @@ func (self *ZipRot) freeName(n int) (err error) {
 	if err = self.freeName(n + 1); err != nil {
 		return
 	}
-	return os.Rename(name, fmt.Sprintf("%v.%v", self.base, n+1))
+	return os.Rename(name, fmt.Sprintf("%v.gz.%v", self.base, n+1))
 }
 
 func (self *ZipRot) rotate(oldZipWriter *ZipWriter) (err error) {
 	if atomic.CompareAndSwapInt64(&self.rotators, 0, 1) {
 		defer atomic.StoreInt64(&self.rotators, 0)
 		if err = self.freeName(1); err != nil {
-			err = fmt.Errorf("Trying to free %v.1: %v", self.base, err)
+			err = fmt.Errorf("Trying to free %v.gz.1: %v", self.base, err)
 			return
 		}
-		if err = os.Rename(self.base, fmt.Sprintf("%v.1", self.base)); err != nil {
+		if err = os.Rename(fmt.Sprintf("%v.gz", self.base), fmt.Sprintf("%v.gz.1", self.base)); err != nil {
 			if os.IsNotExist(err) {
 				err = nil
 			} else {
-				err = fmt.Errorf("Trying to rename %v to %v.1: %v", self.base, self.base, err)
+				err = fmt.Errorf("Trying to rename %v.gz to %v.gz.1: %v", self.base, self.base, err)
 				return
 			}
 		}
-		var newFile *os.File
-		newFile, err = os.OpenFile(self.base, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0640)
+		var newZipWriter *ZipWriter
+		newZipWriter, err = NewZipWriter(self.base)
 		if err != nil {
 			return
 		}
-		newZipWriter := NewZipWriter(newFile)
 		runtime.SetFinalizer(newZipWriter, func(f *ZipWriter) {
 			f.Close()
 		})
