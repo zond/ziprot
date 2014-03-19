@@ -2,6 +2,7 @@ package ziprot
 
 import (
 	"fmt"
+	"log"
 	"math/rand"
 	"os"
 	"runtime"
@@ -20,6 +21,7 @@ type ZipRot struct {
 	maxFiles int64
 	maxSize  int64
 	rotators int64
+	nonblock int64
 }
 
 func New(base string) (self *ZipRot, err error) {
@@ -98,6 +100,15 @@ func (self *ZipRot) MaxSize(n int64) *ZipRot {
 	return self
 }
 
+func (self *ZipRot) Block(b bool) *ZipRot {
+	if b {
+		atomic.StoreInt64(&self.nonblock, 0)
+	} else {
+		atomic.StoreInt64(&self.nonblock, 1)
+	}
+	return self
+}
+
 func (self *ZipRot) Write(p []byte) (n int, err error) {
 	file := self.file()
 	if n, err = file.Write(p); err != nil {
@@ -108,8 +119,16 @@ func (self *ZipRot) Write(p []byte) (n int, err error) {
 		return
 	}
 	if stat.Size() > atomic.LoadInt64(&self.maxSize) {
-		if err = self.rotate(file); err != nil {
-			return
+		if atomic.LoadInt64(&self.nonblock) == 0 {
+			if err = self.rotate(file); err != nil {
+				return
+			}
+		} else {
+			go func() {
+				if err := self.rotate(file); err != nil {
+					log.Printf("While trying to rotate: %v", err)
+				}
+			}()
 		}
 	}
 	return
