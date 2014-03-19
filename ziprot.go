@@ -3,6 +3,7 @@ package ziprot
 import (
 	"compress/gzip"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"os"
@@ -107,7 +108,36 @@ func New(base string) (self *ZipRot, err error) {
 	self = &ZipRot{
 		base: base,
 	}
+	_, err = os.Stat(self.base)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return
+		}
+	} else {
+		if err = self.gzip(self.base, fmt.Sprintf("%v.gz", self.base)); err != nil {
+			return
+		}
+	}
 	if err = self.rotate(nil); err != nil {
+		return
+	}
+	return
+}
+
+func (self *ZipRot) gzip(src, dst string) (err error) {
+	reader, err := os.Open(src)
+	if err != nil {
+		return
+	}
+	defer reader.Close()
+	writer, err := os.Create(dst)
+	if err != nil {
+		return
+	}
+	defer writer.Close()
+	zipWriter := gzip.NewWriter(writer)
+	defer zipWriter.Close()
+	if _, err = io.Copy(zipWriter, reader); err != nil {
 		return
 	}
 	return
