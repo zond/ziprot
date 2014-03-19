@@ -113,5 +113,8 @@ func (self *ZipRot) rotate() (err error) {
 	if err = self.open(); err != nil {
 		return
 	}
-	return oldFile.Sync()
+	if err = oldFile.Sync(); err != nil {
+		return
+	}
+	return
 }
