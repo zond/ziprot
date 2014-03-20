@@ -102,6 +102,7 @@ type ZipRot struct {
 	maxSize    int64
 	rotators   int64
 	nonblock   int64
+	closed     int64
 }
 
 func New(base string) (self *ZipRot, err error) {
@@ -246,8 +247,4 @@ func (self *ZipRot) Write(p []byte) (n int, err error) {
 		}
 	}
 	return
-}
-
-func (self *ZipRot) Close() error {
-	return self.zipWriter().Close()
 }
