@@ -18,7 +18,7 @@ func init() {
 }
 
 type ZipWriter struct {
-	closed     int64
+	closed     int32
 	file       *os.File
 	zipFile    *os.File
 	zipWriter  *gzip.Writer
@@ -59,11 +59,11 @@ func (self *ZipWriter) Size() (result int64, err error) {
 }
 
 func (self *ZipWriter) Closed() bool {
-	return atomic.LoadInt64(&self.closed) == 1
+	return atomic.LoadInt32(&self.closed) == 1
 }
 
 func (self *ZipWriter) Close() (err error) {
-	if atomic.CompareAndSwapInt64(&self.closed, 0, 1) {
+	if atomic.CompareAndSwapInt32(&self.closed, 0, 1) {
 		close(self.zipChannel)
 		<-self.zipDone
 		if err = self.zipWriter.Close(); err != nil {
@@ -80,7 +80,7 @@ func (self *ZipWriter) Close() (err error) {
 }
 
 func (self *ZipWriter) Write(p []byte) (n int, err error) {
-	if atomic.LoadInt64(&self.closed) == 1 {
+	if atomic.LoadInt32(&self.closed) == 1 {
 		err = fmt.Errorf("Writer closed")
 		return
 	}
@@ -98,11 +98,11 @@ func (self *ZipWriter) Sync() (err error) {
 type ZipRot struct {
 	base       string
 	_zipWriter unsafe.Pointer
-	maxFiles   int64
-	maxSize    int64
-	rotators   int64
-	nonblock   int64
-	closed     int64
+	maxFiles   int32
+	maxSize    int32
+	rotators   int32
+	nonblock   int32
+	closed     int32
 }
 
 func New(base string) (self *ZipRot, err error) {
@@ -153,7 +153,7 @@ func (self *ZipRot) freeName(n int) (err error) {
 		}
 		return
 	}
-	if int64(n) >= atomic.LoadInt64(&self.maxFiles) {
+	if int32(n) >= atomic.LoadInt32(&self.maxFiles) {
 		return os.Remove(name)
 	}
 	if err = self.freeName(n + 1); err != nil {
@@ -163,8 +163,8 @@ func (self *ZipRot) freeName(n int) (err error) {
 }
 
 func (self *ZipRot) rotate(oldZipWriter *ZipWriter) (err error) {
-	if atomic.CompareAndSwapInt64(&self.rotators, 0, 1) {
-		defer atomic.StoreInt64(&self.rotators, 0)
+	if atomic.CompareAndSwapInt32(&self.rotators, 0, 1) {
+		defer atomic.StoreInt32(&self.rotators, 0)
 		if err = self.freeName(1); err != nil {
 			err = fmt.Errorf("Trying to free %v.gz.1: %v", self.base, err)
 			return
@@ -200,21 +200,21 @@ func (self *ZipRot) zipWriter() *ZipWriter {
 	return (*ZipWriter)(atomic.LoadPointer(&self._zipWriter))
 }
 
-func (self *ZipRot) MaxFiles(n int64) *ZipRot {
-	atomic.StoreInt64(&self.maxFiles, n)
+func (self *ZipRot) MaxFiles(n int32) *ZipRot {
+	atomic.StoreInt32(&self.maxFiles, n)
 	return self
 }
 
-func (self *ZipRot) MaxSize(n int64) *ZipRot {
-	atomic.StoreInt64(&self.maxSize, n)
+func (self *ZipRot) MaxSize(n int32) *ZipRot {
+	atomic.StoreInt32(&self.maxSize, n)
 	return self
 }
 
 func (self *ZipRot) Block(b bool) *ZipRot {
 	if b {
-		atomic.StoreInt64(&self.nonblock, 0)
+		atomic.StoreInt32(&self.nonblock, 0)
 	} else {
-		atomic.StoreInt64(&self.nonblock, 1)
+		atomic.StoreInt32(&self.nonblock, 1)
 	}
 	return self
 }
@@ -233,8 +233,8 @@ func (self *ZipRot) Write(p []byte) (n int, err error) {
 	if err != nil {
 		return
 	}
-	if size > atomic.LoadInt64(&self.maxSize) {
-		if atomic.LoadInt64(&self.nonblock) == 0 {
+	if int32(size) > atomic.LoadInt32(&self.maxSize) {
+		if atomic.LoadInt32(&self.nonblock) == 0 {
 			if err = self.rotate(zipWriter); err != nil {
 				return
 			}
