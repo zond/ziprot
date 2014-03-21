@@ -31,14 +31,43 @@ func NewZipWriter(base string) (self *ZipWriter, err error) {
 		zipChannel: make(chan []byte),
 		zipDone:    make(chan struct{}, 128),
 	}
-	if self.file, err = os.Create(base); err != nil {
+	if _, err = os.Stat(base); err != nil {
+		if !os.IsNotExist(err) {
+			return
+		}
+		if self.zipFile, err = os.Create(fmt.Sprintf("%v.gz", base)); err != nil {
+			return
+		}
+		self.zipWriter = gzip.NewWriter(self.zipFile)
+		if self.file, err = os.Create(base); err != nil {
+			return
+		}
+	} else {
+		if err = self.restart(base); err != nil {
+			return
+		}
+		if self.file, err = os.OpenFile(base, os.O_APPEND|os.O_WRONLY, 0644); err != nil {
+			return
+		}
+	}
+	go self.zip()
+	return
+}
+
+func (self *ZipWriter) restart(base string) (err error) {
+	reader, err := os.Open(base)
+	if err != nil {
 		return
 	}
-	if self.zipFile, err = os.Create(fmt.Sprintf("%v.gz", base)); err != nil {
+	defer reader.Close()
+	self.zipFile, err = os.Create(fmt.Sprintf("%v.gz", base))
+	if err != nil {
 		return
 	}
 	self.zipWriter = gzip.NewWriter(self.zipFile)
-	go self.zip()
+	if _, err = io.Copy(self.zipWriter, reader); err != nil {
+		return
+	}
 	return
 }
 
@@ -109,36 +138,7 @@ func New(base string) (self *ZipRot, err error) {
 	self = &ZipRot{
 		base: base,
 	}
-	_, err = os.Stat(self.base)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			return
-		}
-	} else {
-		if err = self.gzip(self.base, fmt.Sprintf("%v.gz", self.base)); err != nil {
-			return
-		}
-	}
-	if err = self.rotate(nil); err != nil {
-		return
-	}
-	return
-}
-
-func (self *ZipRot) gzip(src, dst string) (err error) {
-	reader, err := os.Open(src)
-	if err != nil {
-		return
-	}
-	defer reader.Close()
-	writer, err := os.Create(dst)
-	if err != nil {
-		return
-	}
-	defer writer.Close()
-	zipWriter := gzip.NewWriter(writer)
-	defer zipWriter.Close()
-	if _, err = io.Copy(zipWriter, reader); err != nil {
+	if err = self.open(); err != nil {
 		return
 	}
 	return
@@ -159,7 +159,23 @@ func (self *ZipRot) freeName(n int) (err error) {
 	if err = self.freeName(n + 1); err != nil {
 		return
 	}
-	return os.Rename(name, fmt.Sprintf("%v.gz.%v", self.base, n+1))
+	if err = os.Rename(name, fmt.Sprintf("%v.gz.%v", self.base, n+1)); err != nil {
+		return
+	}
+	return
+}
+
+func (self *ZipRot) open() (err error) {
+	var newZipWriter *ZipWriter
+	newZipWriter, err = NewZipWriter(self.base)
+	if err != nil {
+		return
+	}
+	runtime.SetFinalizer(newZipWriter, func(f *ZipWriter) {
+		f.Close()
+	})
+	atomic.StorePointer(&self._zipWriter, unsafe.Pointer(newZipWriter))
+	return
 }
 
 func (self *ZipRot) rotate(oldZipWriter *ZipWriter) (err error) {
@@ -177,20 +193,15 @@ func (self *ZipRot) rotate(oldZipWriter *ZipWriter) (err error) {
 				return
 			}
 		}
-		var newZipWriter *ZipWriter
-		newZipWriter, err = NewZipWriter(self.base)
-		if err != nil {
+		if err = os.Remove(self.base); err != nil {
 			return
 		}
-		runtime.SetFinalizer(newZipWriter, func(f *ZipWriter) {
-			f.Close()
-		})
-		atomic.StorePointer(&self._zipWriter, unsafe.Pointer(newZipWriter))
-		if oldZipWriter != nil {
-			if err = oldZipWriter.Close(); err != nil {
-				err = fmt.Errorf("Trying to sync old file: %v", err)
-				return
-			}
+		if err = self.open(); err != nil {
+			return
+		}
+		if err = oldZipWriter.Close(); err != nil {
+			err = fmt.Errorf("Trying to sync old file: %v", err)
+			return
 		}
 	}
 	return
